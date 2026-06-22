@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from asyncio import sleep
-from datetime import datetime, time
+from datetime import date, datetime, time
 from typing import Any
 
 import voluptuous as vol
@@ -15,6 +15,8 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.event import async_track_time_change
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
 from .api import KoreaGasAppApiError, KoreaGasAppClient
 from .const import (
@@ -45,10 +47,16 @@ SERVICE_SUBMIT_METER_READING = "submit_meter_reading"
 ATTR_ACCOUNT = "account"
 ATTR_READING = "reading"
 
+STORAGE_VERSION = 1
+STORAGE_KEY = f"{DOMAIN}_submission_state"
+DATA_SUBMISSION_STORE = "submission_store"
+SUBMISSION_SOURCE_AUTO = "auto"
+SUBMISSION_SOURCE_MANUAL = "manual"
+
 SUBMIT_METER_READING_SCHEMA = vol.Schema(
     {
         vol.Optional(ATTR_ACCOUNT): cv.string,
-        vol.Required(ATTR_READING): vol.All(vol.Coerce(int), vol.Range(min=0)),
+        vol.Optional(ATTR_READING): vol.All(vol.Coerce(int), vol.Range(min=0)),
     }
 )
 
@@ -77,13 +85,21 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
         entry = entries[0]
         coordinator = entry.runtime_data
-        _validate_reading_range(entry, coordinator, call.data[ATTR_READING])
+        reading = _reading_from_call_or_entity(hass, entry, call)
+        _validate_reading_range(entry, coordinator, reading)
         try:
             result = await coordinator.client.async_submit_meter_reading(
-                call.data[ATTR_READING],
+                reading,
             )
         except KoreaGasAppApiError as err:
             raise HomeAssistantError(str(err)) from err
+        await _async_record_successful_submission(
+            hass,
+            entry,
+            dt_util.now(),
+            reading,
+            SUBMISSION_SOURCE_MANUAL,
+        )
         _LOGGER.info(
             "Submitted Korea Gas App meter reading: input_yn=%s usage=%s message=%s",
             result.input_yn,
@@ -167,6 +183,14 @@ def _schedule_auto_submission(
         if now.day != submit_day:
             return
 
+        if await _async_submission_succeeded_for_period(hass, entry, now):
+            _LOGGER.info(
+                "Skipping Korea Gas App auto submission: entry %s already submitted for %s",
+                entry.entry_id,
+                _submission_period(now),
+            )
+            return
+
         entity_id = _entry_value(entry, CONF_READING_ENTITY_ID)
         if not entity_id:
             _LOGGER.warning(
@@ -209,6 +233,13 @@ def _schedule_auto_submission(
             result.usage,
             result.return_message,
         )
+        await _async_record_successful_submission(
+            hass,
+            entry,
+            now,
+            reading,
+            SUBMISSION_SOURCE_AUTO,
+        )
         await _async_refresh_after_submission(coordinator)
 
     _LOGGER.info(
@@ -233,6 +264,94 @@ def _entry_value(
 ) -> Any:
     """Return an option value, falling back to config-entry data."""
     return entry.options.get(key, entry.data.get(key, default))
+
+
+def _reading_from_call_or_entity(
+    hass: HomeAssistant,
+    entry: KoreaGasAppConfigEntry,
+    call: ServiceCall,
+) -> int:
+    """Return a reading from service data or the configured reading entity."""
+    if ATTR_READING in call.data and call.data[ATTR_READING] is not None:
+        return int(call.data[ATTR_READING])
+
+    entity_id = _entry_value(entry, CONF_READING_ENTITY_ID)
+    if not entity_id:
+        raise HomeAssistantError(
+            "Meter reading was not provided and no reading entity is configured"
+        )
+
+    state = hass.states.get(entity_id)
+    if state is None:
+        raise HomeAssistantError(f"Meter reading entity {entity_id} was not found")
+
+    reading = _state_to_reading(state.state)
+    if reading is None:
+        raise HomeAssistantError(
+            f"Meter reading entity {entity_id} has non-numeric state {state.state}"
+        )
+    return reading
+
+
+def _submission_store(hass: HomeAssistant) -> Store[dict[str, Any]]:
+    """Return the persistent store for submission state."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    if DATA_SUBMISSION_STORE not in domain_data:
+        domain_data[DATA_SUBMISSION_STORE] = Store[dict[str, Any]](
+            hass,
+            STORAGE_VERSION,
+            STORAGE_KEY,
+        )
+    return domain_data[DATA_SUBMISSION_STORE]
+
+
+async def _async_load_submission_state(hass: HomeAssistant) -> dict[str, Any]:
+    """Load persisted submission state."""
+    data = await _submission_store(hass).async_load()
+    if not isinstance(data, dict):
+        return {"entries": {}}
+    entries = data.get("entries")
+    if not isinstance(entries, dict):
+        return {"entries": {}}
+    return {"entries": entries}
+
+
+async def _async_record_successful_submission(
+    hass: HomeAssistant,
+    entry: KoreaGasAppConfigEntry,
+    when: datetime,
+    reading: int,
+    source: str,
+) -> None:
+    """Persist that an entry already submitted for the month."""
+    data = await _async_load_submission_state(hass)
+    entries = data.setdefault("entries", {})
+    entries[entry.entry_id] = {
+        "period": _submission_period(when),
+        "reading": reading,
+        "source": source,
+        "submitted_at": when.isoformat(),
+    }
+    await _submission_store(hass).async_save(data)
+
+
+async def _async_submission_succeeded_for_period(
+    hass: HomeAssistant,
+    entry: KoreaGasAppConfigEntry,
+    when: datetime,
+) -> bool:
+    """Return whether the entry already submitted in the given month."""
+    data = await _async_load_submission_state(hass)
+    entry_data = data["entries"].get(entry.entry_id)
+    return (
+        isinstance(entry_data, dict)
+        and entry_data.get("period") == _submission_period(when)
+    )
+
+
+def _submission_period(value: date | datetime) -> str:
+    """Return the monthly submission period key."""
+    return f"{value.year:04d}-{value.month:02d}"
 
 
 async def _async_refresh_after_submission(

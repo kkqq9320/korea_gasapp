@@ -9,8 +9,7 @@ submit_meter_reading:
         text:
     reading:
       name: Meter reading
-      description: Current gas meter reading value to submit. It must be between the last meter reading and the configured maximum meter reading change.
-      required: true
+      description: Current gas meter reading value to submit. If omitted, the configured meter reading entity is used. It must be between the last meter reading and the configured maximum meter reading change.
       selector:
         number:
           min: 0
